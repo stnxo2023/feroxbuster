@@ -381,32 +381,54 @@ impl ContentType {
 ///   unless overridden by CLI options.
 ///
 pub fn parse_request_file(config: &mut Configuration) -> Result<()> {
-    // read in the file located at config.request_file
+    // read in the file (raw bytes) located at config.request_file
     // parse the file into a Request struct
-    let contents = std::fs::read_to_string(&config.request_file)?;
+    let contents = std::fs::read(&config.request_file)?;
 
     if contents.is_empty() {
         bail!("Empty --request-file file provided");
     }
 
-    // this should split the body from the request line and headers
-    let lines = contents.split("\r\n\r\n").collect::<Vec<&str>>();
+    // find the first header/body separator
+    // locate both \r\n\r\n and \n\n and pick whichever appears earliest,
+    // so that a \r\n\r\n inside the body doesn't shadow a \n\n separator
+    // that terminates the headers
+    let crlf = contents.windows(4).position(|w| w == b"\r\n\r\n");
+    let lf = contents.windows(2).position(|w| w == b"\n\n");
 
-    if lines.len() < 2 {
-        bail!("Invalid request: Missing head/body CRLF separator");
-    }
+    let (sep_idx, sep_len) = match (crlf, lf) {
+        (Some(c), Some(l)) => {
+            if c <= l {
+                (c, 4)
+            } else {
+                (l, 2)
+            }
+        }
+        (Some(c), None) => (c, 4),
+        (None, Some(l)) => (l, 2),
+        (None, None) => bail!("Invalid request: Missing head/body separator"),
+    };
 
-    let head = lines[0];
-    let body = lines[1].as_bytes().to_vec();
+    // split the request head and body
+    let head_bytes = &contents[..sep_idx];
+    let body_bytes = &contents[sep_idx + sep_len..];
 
-    // we only want to use the request's body if the user hasn't
+    // decode only the head; HTTP framing is generally ascii/utf-8
+    // compatible
+    let head = std::str::from_utf8(head_bytes)
+        .map_err(|_| anyhow::anyhow!("Request headers contain invalid UTF-8"))?;
+
+    // normalize line endings in the decoded head
+    let normalized = head.replace("\r\n", "\n");
+
+    // we only want to use the request's body bytes if the user hasn't
     // overridden it on the cli
     if config.data.is_empty() {
-        config.data = body;
+        config.data = body_bytes.to_vec();
     }
 
-    // begin parsing the request line and headers
-    let mut head_parts = head.split("\r\n");
+    // begin parsing the request line and normalized headers
+    let mut head_parts = normalized.split("\n");
 
     let Some(request_line) = head_parts.next() else {
         bail!("Invalid request: Missing request line");
@@ -441,7 +463,7 @@ pub fn parse_request_file(config: &mut Configuration) -> Result<()> {
     }
 
     for mut line in head_parts {
-        line = line.trim();
+        line = line.trim_matches('\r').trim();
 
         if line.is_empty() {
             break; // Empty line signals the end of headers
@@ -904,7 +926,7 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(
             result.unwrap_err().to_string(),
-            "Invalid request: Missing head/body CRLF separator"
+            "Invalid request: Missing head/body separator"
         );
 
         tmp.cleanup();
@@ -1344,5 +1366,146 @@ mod tests {
 
         let result = split_query("");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_raw_lf_only_request() -> io::Result<()> {
+        let mut tmp = TempSetup::new();
+
+        tmp.file
+            .write_all(b"GET / HTTP/1.1\nHost: example.com\n\nbody")?;
+
+        let result = parse_request_file(&mut tmp.config);
+
+        assert!(result.is_ok());
+        assert_eq!(tmp.config.data, b"body".to_vec());
+
+        tmp.cleanup();
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_raw_crlf_request() -> io::Result<()> {
+        let mut tmp = TempSetup::new();
+
+        tmp.file
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\nbody")?;
+
+        let result = parse_request_file(&mut tmp.config);
+
+        assert!(result.is_ok());
+        assert_eq!(tmp.config.data, b"body".to_vec());
+
+        tmp.cleanup();
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_raw_crlf_body_preserved() -> io::Result<()> {
+        let mut tmp = TempSetup::new();
+
+        let body = b"line1\r\nline2\r\nbinary\x00data";
+
+        let mut request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        request.extend_from_slice(body);
+
+        tmp.file.write_all(&request)?;
+
+        parse_request_file(&mut tmp.config).unwrap();
+
+        assert_eq!(tmp.config.data, body.to_vec());
+
+        tmp.cleanup();
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_raw_lf_headers_crlf_body() -> io::Result<()> {
+        let mut tmp = TempSetup::new();
+
+        let body = b"line1\r\nline2\r\n";
+
+        let mut request = b"GET / HTTP/1.1\nHost: example.com\n\n".to_vec();
+        request.extend_from_slice(body);
+
+        tmp.file.write_all(&request)?;
+
+        parse_request_file(&mut tmp.config).unwrap();
+
+        assert_eq!(tmp.config.data, body.to_vec());
+
+        tmp.cleanup();
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_raw_mixed_newlines_headers() -> io::Result<()> {
+        let mut tmp = TempSetup::new();
+
+        tmp.file
+            .write_all(b"GET / HTTP/1.1\r\nHost: example.com\nUser-Agent: test\r\n\nbody")?;
+
+        let result = parse_request_file(&mut tmp.config);
+
+        assert!(result.is_ok());
+        assert_eq!(tmp.config.data, b"body".to_vec());
+        assert!(tmp.config.headers.contains_key("Host"));
+        assert_eq!(tmp.config.headers.get("Host").unwrap(), "example.com");
+        assert_eq!(tmp.config.user_agent, "test");
+
+        tmp.cleanup();
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_raw_binary_body_preserved() -> io::Result<()> {
+        let mut tmp = TempSetup::new();
+
+        let body = b"\x00\xde\xad\xbe\xef\x80binary";
+
+        let mut request = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        request.extend_from_slice(body);
+
+        tmp.file.write_all(&request)?;
+
+        parse_request_file(&mut tmp.config).unwrap();
+
+        assert_eq!(tmp.config.data, body.to_vec());
+
+        tmp.cleanup();
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_raw_lf_headers_with_crlf_crlf_in_body() -> io::Result<()> {
+        // headers are LF-separated; body contains \r\n\r\n
+        let mut tmp = TempSetup::new();
+
+        tmp.file.write_all(
+            b"POST /upload HTTP/1.1\nHost: example.com\nContent-Type: application/octet-stream\n\nabc\r\n\r\ndef",
+        )?;
+
+        let result = parse_request_file(&mut tmp.config);
+
+        assert!(result.is_ok());
+        assert_eq!(tmp.config.data, b"abc\r\n\r\ndef".to_vec());
+        assert_eq!(tmp.config.target_url, "https://example.com/upload");
+
+        tmp.cleanup();
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_raw_crlf_headers_with_lf_lf_in_body() -> io::Result<()> {
+        let mut tmp = TempSetup::new();
+
+        tmp.file
+            .write_all(b"POST /upload HTTP/1.1\r\nHost: example.com\r\n\r\nabc\n\ndef")?;
+
+        parse_request_file(&mut tmp.config).unwrap();
+        assert_eq!(tmp.config.data, b"abc\n\ndef".to_vec());
+
+        tmp.cleanup();
+        Ok(())
     }
 }
